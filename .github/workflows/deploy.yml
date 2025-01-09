@@ -2,11 +2,14 @@ name: CI/CD Pipeline
 
 on:
   push:
-    tags:
-      - 'dev-*'
-      - 'qa-*'
-      - 'uat-*'
-      - 'prod-*'
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
 
 env:
   VAULT_ADDR: ${{ secrets.VAULT_ADDR }}

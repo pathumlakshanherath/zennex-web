@@ -1,0 +1,122 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    tags:
+      - 'dev-*'
+      - 'qa-*'
+      - 'uat-*'
+      - 'prod-*'
+
+env:
+  VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+  VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+  DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+  DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+  DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+
+jobs:
+  # 1. Checkout the code
+  checkout:
+    runs-on: ubuntu-latest
+    outputs:
+      ref_name: ${{ steps.set_env.outputs.ref_name }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        
+      - name: Set Environment
+        id: set_env
+        run: |
+          if [[ "${{ github.ref_name }}" == dev-* ]]; then
+            echo "ref_name=dev" >> $GITHUB_ENV
+          elif [[ "${{ github.ref_name }}" == qa-* ]]; then
+            echo "ref_name=qa" >> $GITHUB_ENV
+          elif [[ "${{ github.ref_name }}" == uat-* ]]; then
+            echo "ref_name=uat" >> $GITHUB_ENV
+          elif [[ "${{ github.ref_name }}" == prod-* ]]; then
+            echo "ref_name=prod" >> $GITHUB_ENV
+          fi
+        outputs:
+          ref_name: ${{ github.ref_name }}
+
+  # 2. Fetch secrets from Vault
+  secrets:
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - name: Fetch Secrets from Vault
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          vault kv get -format=json secret/${{ env.ref_name }}/application | jq -r '.data' > secrets.json
+          export $(cat secrets.json | jq -r 'to_entries|map("\(.key)=\(.value|tostring)")|.[]')
+
+  # 3. Security scan
+  security:
+    runs-on: ubuntu-latest
+    needs: secrets
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Run security scan
+        uses: snyk/actions/cli@master
+        with:
+          args: test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+          
+  # 3. Build the application
+  build:
+    runs-on: ubuntu-latest
+    needs: [checkout, secrets]
+    steps:
+      - name: Build Application
+        run: ./mvnw clean package -DskipTests
+
+  # 4. Test the application
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Run Tests
+        run: ./mvnw test
+
+  # 5. Deploy the application
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - name: Deploy Application
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          scp -i "${{ secrets.DEPLOY_KEY }}" target/*.jar ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/app.jar
+          ssh -i "${{ secrets.DEPLOY_KEY }}" ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "sudo systemctl restart app.service"
+
+  # 6. Monitoring integration
+  monitoring:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Monitoring Setup
+        run: |
+          echo "Monitoring step (e.g., Prometheus or Grafana integration) can be added here."
+
+  # 7. Rollback Mechanism
+  rollback:
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: deploy
+    steps:
+      - name: Rollback Deployment
+        run: |
+          ssh -i "${{ secrets.DEPLOY_KEY }}" ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} <<EOF
+            docker pull myapp:${{ github.sha }}
+            docker run -d -p 8080:8080 myapp:${{ github.sha }}
+          EOF
